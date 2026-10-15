@@ -30,15 +30,19 @@ __copyright__ = '(C) 2022 by Kyaw Naing Win'
 __revision__ = '$Format:%H$'
 
 import os
-import requests
+import math
+import re
+from collections import namedtuple
+from urllib.parse import quote, quote_plus, urlencode
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.core import (QgsProcessingAlgorithm,
-                       QgsProcessingParameterString,
                        QgsProcessingParameterExtent,
                        QgsProcessingParameterEnum,
                        QgsProcessingException,
+                       QgsProcessingParameterString,
+                       QgsRasterLayer,
                        QgsProcessingParameterRasterDestination,
                        QgsCoordinateTransform,
                        QgsCoordinateReferenceSystem,
@@ -47,10 +51,41 @@ from qgis.core import (QgsProcessingAlgorithm,
 import processing
 
 
+Dataset = namedtuple('Dataset', 'label code endpoint parameter area_limit_km2')
+
+# Processing models store enum indices: keep existing entries in order and append new ones.
+DATASETS = (
+    Dataset('Agência Nacional de Águas DEM (ANADEM) 30m', 'ANADEM', 'globaldem', 'demtype', None),
+    Dataset('ALOS World 3D 30m', 'AW3D30', 'globaldem', 'demtype', None),
+    Dataset('ALOS World 3D Ellipsoidal 30m', 'AW3D30_E', 'globaldem', 'demtype', None),
+    Dataset('Copernicus Global DSM 30m', 'COP30', 'globaldem', 'demtype', None),
+    Dataset('Copernicus Global DSM 90m', 'COP90', 'globaldem', 'demtype', None),
+    Dataset('EU DTM 30m', 'EU_DTM', 'globaldem', 'demtype', None),
+    Dataset('GEBCOIceTopo Bathymetry 500m', 'GEBCOIceTopo', 'globaldem', 'demtype', None),
+    Dataset('GEBCOSubIceTopo Bathymetry 500m', 'GEBCOSubIceTopo', 'globaldem', 'demtype', None),
+    Dataset('GEDI L3 1km', 'GEDI_L3', 'globaldem', 'demtype', None),
+    Dataset('Global Bathymetry SRTM15+ V2.55 500m', 'SRTM15Plus', 'globaldem', 'demtype', None),
+    Dataset('Global Ensemble Digital Terrain Model 30m', 'GEDTM30', 'globaldem', 'demtype', None),
+    Dataset('NASADEM Global DEM 30m', 'NASADEM', 'globaldem', 'demtype', None),
+    Dataset('SRTM 30m', 'SRTMGL1', 'globaldem', 'demtype', None),
+    Dataset('SRTM 90m', 'SRTMGL3', 'globaldem', 'demtype', None),
+    Dataset('SRTM GL1 Ellipsoidal 30m', 'SRTMGL1_E', 'globaldem', 'demtype', None),
+    # USGS uses a separate endpoint and datasetName, not the globaldem demtype parameter.
+    Dataset('USGS 3DEP 1 arc-second DEM (~30 m)', 'USGS30m', 'usgsdem', 'datasetName', 225000),
+    Dataset('USGS 3DEP 1/3 arc-second DEM (~10 m)', 'USGS10m', 'usgsdem', 'datasetName', 25000),
+    Dataset('USGS 3DEP 1 meter DEM', 'USGS1m', 'usgsdem', 'datasetName', 250),
+)
+
+
 class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
 
     OUTPUT = 'OUTPUT'
     INPUT = 'INPUT'
+
+    def createCustomParametersWidget(self, parent=None):
+        # Import GUI code only when opening the interactive dialog.
+        from .OpenTopography_DEMDownloader_coverage import CoverageDialog
+        return CoverageDialog(self, parent=parent)
 
     def initAlgorithm(self, config):
         settings = QgsSettings()
@@ -64,25 +99,10 @@ class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterEnum(
                 'DEMs',
                 'Select DEM to download',
-                options=[
-                         'Agência Nacional de Águas DEM (ANADEM) 30m',
-                         'ALOS World 3D 30m',
-                         'ALOS World 3D Ellipsoidal 30m',
-                         'Copernicus Global DSM 30m',
-                         'Copernicus Global DSM 90m',
-                         'EU DTM 30m',
-                         'GEBCOIceTopo Bathymetry 500m',
-                         'GEBCOSubIceTopo Bathymetry 500m',
-                         'GEDI L3 1km',
-                         'Global Bathymetry SRTM15+ V2.55 500m',
-                         'Global Ensemble Digital Terrain Model 30m',
-                         'NASADEM Global DEM 30m',
-                         'SRTM 30m',
-                         'SRTM 90m',
-                         'SRTM GL1 Ellipsoidal 30m'
-                ],
+                options=[dataset.label for dataset in DATASETS],
                 allowMultiple=False,
-                defaultValue=[13]
+                # Single-selection enums need a scalar index; a list selects item 0.
+                defaultValue=3  # Copernicus Global DSM 30m; preserve dataset ordering.
             )
         )
         self.addParameter(QgsProcessingParameterExtent('Extent', 'Define extent to download', defaultValue=None))
@@ -93,8 +113,22 @@ class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
         settings = QgsSettings()
         outputs = {}
 
-        # process extent bbox information
+        if feedback.isCanceled():
+            return {}
+        # The enum accessor can fall back to a default for out-of-range values.
+        # Reject invalid explicit selections before resolving the saved enum index.
+        if not self.parameterDefinition('DEMs').checkValueIsAcceptable(parameters.get('DEMs'), context):
+            raise QgsProcessingException(self.tr('Select a valid DEM dataset.'))
+        dataset_index = self.parameterAsEnum(parameters, 'DEMs', context)
+        if not 0 <= dataset_index < len(DATASETS):
+            raise QgsProcessingException(self.tr('Select a valid DEM dataset.'))
+        dataset = DATASETS[dataset_index]
+        dem_code = dataset.code
+
+        # Transform the request bounds, not the downloaded raster, to the API's CRS.
         crs = self.parameterAsExtentCrs(parameters, "Extent", context)
+        if not crs.isValid():
+            raise QgsProcessingException(self.tr('The download extent requires a valid CRS.'))
         extent = self.parameterAsExtentGeometry(
             parameters, "Extent", context
         ).boundingBox()
@@ -106,40 +140,34 @@ class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
                 QgsProject.instance(),
             ).transformBoundingBox(extent)
 
-        dem_codes = [
-                     'ANADEM',
-                     'AW3D30',
-                     'AW3D30_E',
-                     'COP30',
-                     'COP90',
-                     'EU_DTM',
-                     'GEBCOIceTopo',
-                     'GEBCOSubIceTopo',
-                     'GEDI_L3',
-                     'SRTM15Plus',
-                     'GEDTM30',
-                     'NASADEM',
-                     'SRTMGL1',
-                     'SRTMGL3',
-                     'SRTMGL1_E'
-
-        ]
-
-        dem_code = dem_codes[parameters['DEMs']]
-
         south = extent.yMinimum()
         north = extent.yMaximum()
         west = extent.xMinimum()
         east = extent.xMaximum()
-        
+
+        if not (all(math.isfinite(value) for value in (south, north, west, east))
+                and -90 <= south < north <= 90 and -180 <= west < east <= 180):
+            raise QgsProcessingException(self.tr(
+                'Select a non-empty extent within valid longitude/latitude bounds. '
+                'Split areas crossing the antimeridian into separate requests.'))
+
+        if dataset.area_limit_km2 is not None:
+            # OT remains authoritative for coverage and area limits; a US bounding box
+            # would incorrectly exclude territories and cannot describe patchy 1 m coverage.
+            feedback.pushInfo(self.tr('Maximum request area for {0}: {1:,} km².').format(
+                dataset.label, dataset.area_limit_km2))
+            if dem_code == 'USGS1m':
+                feedback.pushInfo(self.tr(
+                    'USGS 1 m requires an authorized OpenTopography API key; coverage varies.'))
+
         # check bounding box if ANADEM is selected
         anadem_north = 14.07948
         anadem_south = -56.51552
         anadem_east= -34.72655
         anadem_west= -82.51655
-        
+
         if dem_code == 'ANADEM':
-            
+
             # 1. Check if the extent INTERSECTS with ANADEM extent
             intersects = (
                 west <= anadem_east and
@@ -161,34 +189,36 @@ class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
                 fatalError=False
                 )
                 return {} #just waiting to correct the error
-            
+
             elif not is_within:
                 feedback.pushWarning("Selected extent extends beyond the ANADEM coverage area. But only avaiable data will be downloaded")
-        
-        dem_url = (
-            f"https://portal.opentopography.org/API/globaldem?demtype={dem_code}"
-            f"&south={south}&north={north}&west={west}&east={east}&outputFormat=GTiff"
-        )
-        dem_url = dem_url + "&API_Key=" + parameters['OT_AUTH_TOKEN']
 
         dem_file = self.parameterAsFileOutput(parameters, self.OUTPUT, context)
+        # USGS requests use datasetName on usgsdem; global datasets retain demtype.
+        query = {dataset.parameter: dem_code, 'south': south, 'north': north,
+                 'west': west, 'east': east, 'outputFormat': 'GTiff',
+                 'API_Key': parameters['OT_AUTH_TOKEN']}
+        dem_url = 'https://portal.opentopography.org/API/{0}?{1}'.format(
+            dataset.endpoint, urlencode(query))
         try:
-            # Download file
-            alg_params = {
-                'URL': dem_url,
-                'OUTPUT': dem_file
-            }
             outputs['DownloadFile'] = processing.run(
-                'native:filedownloader',
-                alg_params,
-                context=context,
-                feedback=feedback,
-                is_child_algorithm=True
-            )
+                'native:filedownloader', {'URL': dem_url, 'OUTPUT': dem_file},
+                context=context, feedback=feedback, is_child_algorithm=True)
             settings.setValue("OpenTopographyDEMDownloader/ot_api_key", parameters['OT_AUTH_TOKEN'])
-        except Exception:
-            response = requests.request("GET", dem_url, headers={}, data={})
-            raise QgsProcessingException(response.text.split('<error>')[1][:-8])
+        except Exception as error:
+            if feedback.isCanceled():
+                return {}
+            # Do not repeat a potentially slow USGS request just to obtain an error.
+            raise QgsProcessingException(self.tr('Download failed for {0}. {1}').format(
+                dataset.label, self.downloadErrorHint(error, parameters['OT_AUTH_TOKEN']))) from None
+        if feedback.isCanceled():
+            return {}
+        if not QgsRasterLayer(dem_file, dem_code, 'gdal').isValid():
+            raise QgsProcessingException(self.tr(
+                'No readable raster was returned for {0}. Check coverage, API-key '
+                'authorization, request-area limits, and service availability.'
+            ).format(dataset.label))
+        outputs['DownloadFile'] = {'OUTPUT': dem_file}
 
         # Load layer into project
         dem_file_name = os.path.basename(dem_file)
@@ -211,6 +241,36 @@ class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
         )
 
         return {self.OUTPUT: outputs['DownloadFile']['OUTPUT']}
+
+    def downloadErrorHint(self, error, api_key):
+        diagnostic = None
+        try:
+            # Classify in memory; only fixed messages reach logs, never the raw error.
+            diagnostic = str(error)
+            if api_key:
+                for secret in (api_key, quote(api_key, safe=''), quote_plus(api_key)):
+                    diagnostic = diagnostic.replace(secret, '[redacted]')
+            diagnostic = re.sub(r'https?://[^\s<>]+', '[URL]', diagnostic, flags=re.IGNORECASE)
+            diagnostic = diagnostic.lower()
+            if re.search(r'\b(timed out|timeout)\b', diagnostic):
+                return self.tr(
+                    'The network request timed out. Try a smaller extent or increase '
+                    'Timeout for network requests (ms) in QGIS Options > Network '
+                    '(for example, 300000 for five minutes), then retry. '
+                    'OpenTopography or USGS may also be temporarily unavailable.')
+            if re.search(r'\b(unauthorized|forbidden|authentication required)\b', diagnostic):
+                return self.tr(
+                    'The service denied access. Check that your OpenTopography API key '
+                    'is valid and authorized for this dataset, especially USGS 1 m.')
+            if 'too many requests' in diagnostic:
+                return self.tr('The service rate limit was reached. Wait before retrying.')
+            return self.tr(
+                'Check API-key authorization, dataset coverage, request-area limits, '
+                'and OpenTopography/USGS service availability.')
+
+        finally:
+            diagnostic = error = api_key = secret = None
+
 
     def name(self):
         """
@@ -261,6 +321,12 @@ class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
         As of Jan 2022, an access key is required for all DEMs. 
         Read https://opentopography.org/blog/introducing-api-keys-access-opentopography-global-datasets how to get an access key.
         
+        USGS 3DEP 1 arc-second DEM (~30 m), USGS 3DEP 1/3 arc-second DEM (~10 m),
+        and USGS 3DEP 1 meter DEM.
+        Maximum request areas: 225,000 km² (30 m), 25,000 km² (10 m), 250 km² (1 m).
+        OpenTopography enforces these limits. Coverage varies; 1 m requires an authorized key.
+        USGS downloads depend on USGS service availability. No automatic tiling is performed.
+
         Developed by: Kyaw Naing Win
         
         Version: 4.2
