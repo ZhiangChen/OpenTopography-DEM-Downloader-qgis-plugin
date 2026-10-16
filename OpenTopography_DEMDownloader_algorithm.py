@@ -35,13 +35,13 @@ import re
 from collections import namedtuple
 from urllib.parse import quote, quote_plus, urlencode
 
-from qgis.PyQt.QtCore import QCoreApplication
+from qgis.PyQt.QtCore import QCoreApplication, QEventLoop, QUrl
 from qgis.PyQt.QtGui import QIcon
 from qgis.core import (QgsProcessingAlgorithm,
                        QgsProcessingParameterExtent,
                        QgsProcessingParameterEnum,
                        QgsProcessingException,
-                       QgsProcessingParameterString,
+                       QgsFileDownloader,
                        QgsRasterLayer,
                        QgsProcessingParameterRasterDestination,
                        QgsCoordinateTransform,
@@ -49,6 +49,7 @@ from qgis.core import (QgsProcessingAlgorithm,
                        QgsProject,
                        QgsSettings)
 import processing
+from . import OpenTopography_DEMDownloader_credentials as credentials
 
 
 Dataset = namedtuple('Dataset', 'label code endpoint parameter area_limit_km2')
@@ -88,12 +89,8 @@ class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
         return CoverageDialog(self, parent=parent)
 
     def initAlgorithm(self, config):
-        settings = QgsSettings()
-        ot_auth_token = settings.value("OpenTopographyDEMDownloader/ot_api_key", "")
-        if not ot_auth_token:
-            auth_prompt = self.tr('Enter OpenTopography access key')
-        else:
-            auth_prompt = self.tr('Enter OpenTopography access key (or use existing one below)')
+        # Retire legacy plaintext storage without reading or silently migrating it.
+        QgsSettings().remove(credentials.LEGACY_KEY)
 
         self.addParameter(
             QgsProcessingParameterEnum(
@@ -106,11 +103,27 @@ class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
             )
         )
         self.addParameter(QgsProcessingParameterExtent('Extent', 'Define extent to download', defaultValue=None))
-        self.addParameter(QgsProcessingParameterString('OT_AUTH_TOKEN', auth_prompt, multiLine=False, defaultValue=ot_auth_token))
         self.addParameter(QgsProcessingParameterRasterDestination(self.OUTPUT, self.tr('Output Raster')))
 
+    def prepareAlgorithm(self, parameters, context, feedback):
+        if 'OT_AUTH_TOKEN' in parameters:
+            raise QgsProcessingException('OT_AUTH_TOKEN is no longer accepted. Save the key in Credentials and remove it from your command.')
+        if feedback.isCanceled():
+            return False
+        # Check availability without retaining a key on the execution clone.
+        credentials.read_key()
+        return True
+
     def processAlgorithm(self, parameters, context, feedback):
-        settings = QgsSettings()
+        if feedback.isCanceled():
+            return {}
+        with credentials.request_key() as api_key:
+            try:
+                return self._processRequest(parameters, context, feedback, api_key)
+            finally:
+                api_key = None
+
+    def _processRequest(self, parameters, context, feedback, api_key):
         outputs = {}
 
         if feedback.isCanceled():
@@ -194,23 +207,8 @@ class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
                 feedback.pushWarning("Selected extent extends beyond the ANADEM coverage area. But only avaiable data will be downloaded")
 
         dem_file = self.parameterAsFileOutput(parameters, self.OUTPUT, context)
-        # USGS requests use datasetName on usgsdem; global datasets retain demtype.
-        query = {dataset.parameter: dem_code, 'south': south, 'north': north,
-                 'west': west, 'east': east, 'outputFormat': 'GTiff',
-                 'API_Key': parameters['OT_AUTH_TOKEN']}
-        dem_url = 'https://portal.opentopography.org/API/{0}?{1}'.format(
-            dataset.endpoint, urlencode(query))
-        try:
-            outputs['DownloadFile'] = processing.run(
-                'native:filedownloader', {'URL': dem_url, 'OUTPUT': dem_file},
-                context=context, feedback=feedback, is_child_algorithm=True)
-            settings.setValue("OpenTopographyDEMDownloader/ot_api_key", parameters['OT_AUTH_TOKEN'])
-        except Exception as error:
-            if feedback.isCanceled():
-                return {}
-            # Do not repeat a potentially slow USGS request just to obtain an error.
-            raise QgsProcessingException(self.tr('Download failed for {0}. {1}').format(
-                dataset.label, self.downloadErrorHint(error, parameters['OT_AUTH_TOKEN']))) from None
+        # Resolve secrets inside the request, never through nested processing inputs.
+        self.requestRaster(dataset, (south, north, west, east), api_key, dem_file, feedback)
         if feedback.isCanceled():
             return {}
         if not QgsRasterLayer(dem_file, dem_code, 'gdal').isValid():
@@ -241,6 +239,61 @@ class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
         )
 
         return {self.OUTPUT: outputs['DownloadFile']['OUTPUT']}
+
+    def requestRaster(self, dataset, bounds, api_key, output, feedback):
+        south, north, west, east = bounds
+        query = {dataset.parameter: dataset.code, 'south': south, 'north': north,
+                 'west': west, 'east': east, 'outputFormat': 'GTiff', 'API_Key': api_key}
+        url = 'https://portal.opentopography.org/API/{0}?{1}'.format(dataset.endpoint, urlencode(query))
+        try:
+            self.downloadFile(url, output, feedback, api_key)
+        finally:
+            query.clear()
+            url = api_key = None
+
+    def downloadFile(self, url, output, feedback, api_key):
+        # native:filedownloader prints its URL; use the same network stack directly.
+        loop = QEventLoop()
+        downloader = None
+        state = {'done': False, 'success': False, 'hint': None}
+        def failed(errors):
+            state['hint'] = self.downloadErrorHint(' '.join(errors), api_key)
+        def completed(_url):
+            state['success'] = True
+        def exited():
+            state['done'] = True
+            loop.quit()
+        def progress(received, total):
+            if total > 0:
+                feedback.setProgress(100.0 * received / total)
+        try:
+            if feedback.isCanceled():
+                return
+            downloader = QgsFileDownloader(QUrl(url), output, '', True)
+            downloader.downloadError.connect(failed)
+            downloader.downloadCompleted.connect(completed)
+            downloader.downloadExited.connect(exited)
+            downloader.downloadProgress.connect(progress)
+            feedback.canceled.connect(downloader.cancelDownload)
+            downloader.startDownload()
+            if feedback.isCanceled() and not state['done']:
+                downloader.cancelDownload()
+            if not state['done']:
+                loop.exec()
+            if not feedback.isCanceled() and (state['hint'] or not state['success']):
+                raise QgsProcessingException(state['hint'] or self.downloadErrorHint('', api_key))
+        except Exception as error:
+            if not feedback.isCanceled():
+                hint = state['hint'] or self.downloadErrorHint(error, api_key)
+                raise QgsProcessingException(self.tr('Download failed. {0}').format(hint)) from None
+        finally:
+            url = api_key = None
+            if downloader is not None:
+                try:
+                    feedback.canceled.disconnect(downloader.cancelDownload)
+                    downloader.deleteLater()
+                except (TypeError, RuntimeError):
+                    pass  # QGIS may already have destroyed an exited downloader.
 
     def downloadErrorHint(self, error, api_key):
         diagnostic = None
@@ -318,6 +371,10 @@ class OpenTopographyDEMDownloaderAlgorithm(QgsProcessingAlgorithm):
         help_text = """               
         This tool will download DEM for the extent defined by user, from OpenTopography (https://opentopography.org/)
         
+        Save one OpenTopography API key in the Credentials tab. QGIS stores it encrypted.
+        Python, command/JSON exports, models and batch rows contain no API-key parameter.
+        Unlock QGIS authentication before running; unattended jobs must provision access
+        to the same authentication database and master password before startup.
         As of Jan 2022, an access key is required for all DEMs. 
         Read https://opentopography.org/blog/introducing-api-keys-access-opentopography-global-datasets how to get an access key.
         

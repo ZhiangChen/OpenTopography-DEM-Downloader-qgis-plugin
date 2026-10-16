@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from urllib.parse import parse_qs, urlsplit
 
 from osgeo import gdal
@@ -55,30 +55,69 @@ class DownloadTests(unittest.TestCase):
         self.context.setProject(QgsProject.instance())
         self.feedback = QgsProcessingFeedback()
         self.key = 'synthetic-key+&secret'
+        creds = plugin.credentials
+        self.auth_patch = patch.object(creds, 'manager')
+        self.auth = self.auth_patch.start().return_value
+        self.addCleanup(self.auth_patch.stop)
+        self.auth.isDisabled.return_value = False
+        self.auth.masterPasswordIsSet.return_value = True
+        self.auth.masterPasswordHashInDatabase.return_value = True
+        self.auth.passwordHelperEnabled.return_value = False
+        self.auth.passwordHelperDisplayName.return_value = 'Keychain'
+        from qgis.core import QgsAuthMethodConfig
+        config = QgsAuthMethodConfig()
+        config.setId(creds.DEFAULT_ID)
+        config.setName(creds.CONFIG_NAME)
+        config.setMethod('Basic')
+        config.setConfig('password', self.key)
+        self.auth.availableAuthMethodConfigs.return_value = {creds.DEFAULT_ID: config}
+        self.auth.loadAuthenticationConfig.return_value = (True, config)
+        self.credential_settings_patch = patch.object(creds, 'QgsSettings', return_value=self.settings)
+        self.credential_settings_patch.start()
+        self.addCleanup(self.credential_settings_patch.stop)
         self.params = {
             'DEMs': 15, 'Extent': '-105.01,-105,40,40.01 [EPSG:4326]',
             'OUTPUT': str(Path(self.temp.name) / 'OUTPUT.tif'),
-            'OT_AUTH_TOKEN': self.key,
         }
         self.calls = []
 
     def run_algorithm(self, failure=None, body=None, cancel=False):
-        def run(name, params, **kwargs):
+        from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
+        outer = self
+        class Downloader(QObject):
+            downloadError = pyqtSignal(list)
+            downloadCompleted = pyqtSignal(object)
+            downloadExited = pyqtSignal()
+            downloadProgress = pyqtSignal(int, int)
+            def __init__(self, url, output, authcfg, delay):
+                super().__init__()
+                self.url, self.output = url, output
+                outer.calls.append(('download', {'URL': bytes(url.toEncoded()).decode(), 'OUTPUT': output}))
+            def cancelDownload(self):
+                self.downloadExited.emit()
+            def startDownload(self):
+                def respond():
+                    if cancel:
+                        outer.feedback.cancel()
+                    elif failure:
+                        self.downloadError.emit([failure + ' ' + self.url.toString()])
+                    elif body is not None:
+                        Path(self.output).write_text(body)
+                        self.downloadCompleted.emit(self.url)
+                    else:
+                        write_raster(self.output)
+                        self.downloadCompleted.emit(self.url)
+                    self.downloadExited.emit()
+                QTimer.singleShot(0, respond)
+        def load(name, params, **kwargs):
             self.calls.append((name, params))
-            if name == 'native:filedownloader':
-                if cancel:
-                    self.feedback.cancel()
-                    return {'OUTPUT': params['OUTPUT']}
-                if failure:
-                    raise QgsProcessingException(failure + ' ' + params['URL'])
-                if body is not None:
-                    Path(params['OUTPUT']).write_text(body)
-                else:
-                    write_raster(params['OUTPUT'])
-                return {'OUTPUT': params['OUTPUT']}
+            self.assertEqual(name, 'native:loadlayer')
+            self.assertNotIn(self.key, str(params))
             return {'OUTPUT': params['INPUT']}
-        with patch.object(plugin.processing, 'run', side_effect=run):
-            return self.algorithm.processAlgorithm(self.params, self.context, self.feedback)
+        with patch.object(plugin, 'QgsFileDownloader', Downloader), patch.object(plugin.processing, 'run', side_effect=load):
+            result = self.algorithm.processAlgorithm(self.params, self.context, self.feedback)
+        self.assertFalse(plugin.credentials.busy())
+        return result
 
     def test_existing_indices_and_default(self):
         self.assertEqual([d.code for d in plugin.DATASETS[:15]], [
@@ -186,33 +225,52 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(self.run_algorithm(cancel=True), {})
         self.assertEqual(len(self.calls), 1)
 
-    def test_original_key_parameter_and_settings(self):
-        self.settings.value.return_value = 'synthetic-saved-key'
-        algorithm = plugin.OpenTopographyDEMDownloaderAlgorithm()
-        algorithm.initAlgorithm({})
-        self.assertEqual(algorithm.parameterDefinition('OT_AUTH_TOKEN').defaultValue(), 'synthetic-saved-key')
-        self.settings.remove.assert_not_called()
+    def test_no_key_in_parameters_exports_or_settings(self):
+        self.assertIsNone(self.algorithm.parameterDefinition('OT_AUTH_TOKEN'))
+        self.settings.remove.assert_called_with(plugin.credentials.LEGACY_KEY)
         self.run_algorithm()
-        self.settings.setValue.assert_called_with('OpenTopographyDEMDownloader/ot_api_key', self.key)
-        self.assertIn('OT_AUTH_TOKEN', self.algorithm.asPythonCommand(self.params, self.context))
+        self.settings.setValue.assert_not_called()
+        serialized = self.algorithm.asPythonCommand(self.params, self.context) + str(self.algorithm.asMap(self.params, self.context))
+        self.assertNotIn('OT_AUTH_TOKEN', serialized)
+        self.assertNotIn(self.key, serialized)
         self.assertTrue(self.algorithm.flags() & plugin.QgsProcessingAlgorithm.FlagSupportsBatch)
         self.assertFalse(self.algorithm.flags() & plugin.QgsProcessingAlgorithm.FlagHideFromModeler)
 
     def test_processing_run_with_native_download_and_load(self):
-        # Exercise the automation entry point and real native downloader with a local
-        # fixture. Settings are mocked so tests never read/write the user's real key.
         source = Path(self.temp.name) / 'source.tif'
         write_raster(source)
-        real_run = plugin.processing.run
-        def local_download(name, params, **kwargs):
-            if name == 'native:filedownloader':
-                params = dict(params, URL=source.as_uri())
-            return real_run(name, params, **kwargs)
-        with patch.object(plugin.processing, 'run', side_effect=local_download):
-            result = real_run(self.algorithm, self.params, context=self.context, feedback=self.feedback)
+        def local_download(dataset, bounds, key, output, feedback):
+            self.algorithm.downloadFile(source.as_uri(), output, feedback, key)
+        with patch.object(plugin.OpenTopographyDEMDownloaderAlgorithm, 'requestRaster', side_effect=local_download):
+            result = plugin.processing.run(self.algorithm, self.params, context=self.context, feedback=self.feedback)
         self.assertTrue(Path(result['OUTPUT']).is_file())
         self.assertTrue(any(d.name == 'USGS30m[Memory]' for d in self.context.layersToLoadOnCompletion().values()))
+        self.assertNotIn(self.key, self.feedback.textLog())
+        self.assertNotIn('API_Key', self.feedback.textLog())
 
+    def test_locked_or_missing_fails_without_prompt(self):
+        self.auth.masterPasswordIsSet.return_value = False
+        with self.assertRaisesRegex(QgsProcessingException, 'locked'):
+            self.algorithm.prepareAlgorithm(self.params, self.context, self.feedback)
+        self.auth.availableAuthMethodConfigs.return_value = {}
+        with self.assertRaisesRegex(QgsProcessingException, 'No OpenTopography key'):
+            self.algorithm.prepareAlgorithm(self.params, self.context, self.feedback)
+        self.auth.setMasterPassword.assert_not_called()
+
+    def test_old_parameter_rejected(self):
+        with self.assertRaisesRegex(QgsProcessingException, 'no longer accepted'):
+            self.algorithm.prepareAlgorithm(dict(self.params, OT_AUTH_TOKEN='old-key'), self.context, self.feedback)
+
+    def test_active_request_blocks_key_mutation_and_releases_after_error(self):
+        with self.assertRaises(RuntimeError):
+            with plugin.credentials.request_key():
+                self.assertTrue(plugin.credentials.busy())
+                with self.assertRaisesRegex(QgsProcessingException, 'active downloads'):
+                    plugin.credentials.remove_key()
+                with self.assertRaisesRegex(QgsProcessingException, 'active downloads'):
+                    plugin.credentials.save_key('replacement-key')
+                raise RuntimeError('simulated failure')
+        self.assertFalse(plugin.credentials.busy())
 
     def coverage_dialog(self):
         from qgis.PyQt.QtWidgets import QMainWindow
@@ -227,7 +285,7 @@ class DownloadTests(unittest.TestCase):
     def test_coverage_dialog_preserves_parameters_and_batch(self):
         dialog = self.coverage_dialog()
         self.assertEqual(dialog.mainWidget().wrappers['DEMs'].parameterValue(), 3)
-        self.assertEqual(set(dialog.mainWidget().wrappers), {'DEMs', 'Extent', 'OT_AUTH_TOKEN', 'OUTPUT'})
+        self.assertEqual(set(dialog.mainWidget().wrappers), {'DEMs', 'Extent', 'OUTPUT'})
         self.assertFalse(dialog.runAsBatchButton.isHidden())
         self.assertEqual(dialog.mainWidget().coverageButton.text(), 'Show coverage')
 
@@ -309,6 +367,215 @@ class DownloadTests(unittest.TestCase):
         self.assertTrue(dialog.mainWidget().coverageButton.isEnabled())
         self.assertEqual(set(QgsProject.instance().mapLayers()), before)
         reply.deleteLater.assert_called_once()
+
+
+    def test_credentials_tab_suffix_draft_clear_and_legacy_history(self):
+        dialog = self.coverage_dialog()
+        panel = dialog.credentialsPanel
+        self.assertIn(self.key[-4:], panel.status.text())
+        self.assertNotIn(self.key, panel.status.text())
+        self.assertEqual(panel.keyEdit.text(), '')
+        self.assertEqual(dialog.tabWidget().tabText(2), 'Credentials')
+        dialog.setParameters({'DEMs': 17, 'OT_AUTH_TOKEN': 'legacy-secret'})
+        self.assertNotIn('OT_AUTH_TOKEN', dialog.mainWidget().wrappers)
+        self.auth.masterPasswordIsSet.return_value = False
+        panel.refresh()
+        self.assertIn('locked', panel.status.text())
+        self.assertNotIn(self.key[-4:], panel.status.text())
+        panel.keyEdit.setText('unsaved-secret')
+        dialog.reject()
+        self.assertEqual(panel.keyEdit.text(), '')
+        panel.keyEdit.undo()
+        self.assertEqual(panel.keyEdit.text(), '')
+
+    def test_credentials_ui_save_and_remove(self):
+        dialog = self.coverage_dialog()
+        panel = dialog.credentialsPanel
+        panel.keyEdit.setText('replacement-key')
+        with patch.object(plugin.credentials, 'save_key') as save:
+            panel.save()
+            save.assert_called_once_with('replacement-key')
+        self.assertEqual(panel.keyEdit.text(), '')
+        with patch.object(plugin.credentials, 'remove_key') as remove:
+            panel.remove()
+            remove.assert_called_once()
+        self.auth.availableAuthMethodConfigs.return_value = {}
+        panel.refresh()
+        self.assertIn('No key saved', panel.status.text())
+        self.assertFalse(panel.removeButton.isEnabled())
+        with patch.object(importlib.import_module('processing.gui.AlgorithmDialog').AlgorithmDialog, 'runAlgorithm') as run:
+            dialog.runAlgorithm()
+            run.assert_not_called()
+        self.assertIs(dialog.tabWidget().currentWidget(), panel)
+
+    def test_real_batch_runs_two_rows_without_key_parameters(self):
+        from processing.gui.BatchAlgorithmDialog import BatchAlgorithmDialog
+        from qgis.PyQt.QtCore import QEventLoop, QTimer, Qt
+        from qgis.PyQt.QtWidgets import QTextBrowser
+        dialog = BatchAlgorithmDialog(self.algorithm)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        from qgis.PyQt import sip
+        self.addCleanup(lambda: dialog.deleteLater() if not sip.isdeleted(dialog) else None)
+        logs = []
+        self.assertEqual(dialog.mainWidget().tblParameters.columnCount(), 3)
+        rows = [dict(self.params, DEMs=index, OUTPUT=str(Path(self.temp.name) / ('batch'+str(index)+'.tif')))
+                for index in (15, 17)]
+        requests = []
+        def request(dataset, bounds, key, output, feedback):
+            self.assertEqual(key, self.key)
+            requests.append(dataset.code)
+            logs.append(feedback.textLog())
+            write_raster(output)
+        loop = QEventLoop()
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+        poll = QTimer()
+        poll.timeout.connect(lambda: loop.quit() if sip.isdeleted(dialog) or (len(requests) == 2 and dialog.runButton().isEnabled()) else None)
+        with patch.object(plugin.OpenTopographyDEMDownloaderAlgorithm, 'requestRaster', side_effect=request), \
+             patch.object(plugin.processing, 'run', side_effect=lambda name, params, **kw: {'OUTPUT': params['INPUT']}), \
+             patch.object(dialog, 'handleAlgorithmResults', return_value=None):
+            timer.start(5000)
+            poll.start(10)
+            dialog.execute(rows)
+            loop.exec()
+            poll.stop()
+            timer.stop()
+        self.assertEqual(requests, ['USGS30m', 'USGS1m'])
+        self.assertFalse(plugin.credentials.busy())
+        for row in rows:
+            self.assertTrue(Path(row['OUTPUT']).is_file())
+        for log in logs:
+            self.assertNotIn(self.key, log)
+            self.assertNotIn('OT_AUTH_TOKEN', log)
+
+    def test_authentication_states_and_actions(self):
+        dialog = self.coverage_dialog()
+        panel = dialog.credentialsPanel
+        self.auth.availableAuthMethodConfigs.return_value = {}
+        self.auth.masterPasswordIsSet.return_value = False
+        self.auth.masterPasswordHashInDatabase.return_value = False
+        panel.refresh()
+        self.assertEqual(panel.status.text(), 'No key saved')
+        self.assertEqual(panel.storageStatus.text(), 'Not configured')
+        self.assertIn('create a master password', panel.storageStatus.toolTip())
+        self.assertFalse(hasattr(panel, 'unlockButton'))
+        panel.keyEdit.setText('new-key-A123')
+        self.assertTrue(panel.saveButton.isEnabled())
+        self.auth.masterPasswordHashInDatabase.return_value = True
+        panel.pollState()
+        self.assertEqual(panel.storageStatus.text(), 'Locked')
+        self.assertEqual(panel.status.text(), 'No key saved')
+        self.assertTrue(panel.saveButton.isEnabled())
+        self.auth.masterPasswordIsSet.return_value = True
+        panel.pollState()
+        self.assertEqual(panel.storageStatus.text(), 'Unlocked')
+        self.assertTrue(panel.lockStorageButton.isEnabled())
+        self.auth.passwordHelperEnabled.return_value = True
+        panel.pollState()
+        self.assertIn('If a valid password is saved', panel.storageStatus.toolTip())
+        self.auth.isDisabled.return_value = True
+        panel.pollState()
+        self.assertEqual(panel.storageStatus.text(), 'Unavailable')
+        self.assertFalse(panel.lockStorageButton.isEnabled())
+        self.assertFalse(panel.saveButton.isEnabled())
+        self.assertFalse(panel.removeButton.isEnabled())
+
+    def test_master_password_actions_respect_busy_and_unavailable_states(self):
+        panel = self.coverage_dialog().credentialsPanel
+        ui = importlib.import_module(ROOT.name + '.OpenTopography_DEMDownloader_credentials_ui')
+        with patch.object(ui, 'QgsAuthEditorWidgets') as editor:
+            self.auth.masterPasswordHashInDatabase.return_value = False
+            panel.refresh()
+            self.assertFalse(panel.changeMasterButton.isEnabled())
+            panel.changeMasterPassword()
+            editor.assert_not_called()
+            self.auth.masterPasswordHashInDatabase.return_value = True
+            with plugin.credentials.request_key():
+                panel.refresh()
+                self.assertFalse(panel.changeMasterButton.isEnabled())
+                self.assertFalse(panel.forgetMasterButton.isEnabled())
+                panel.changeMasterPassword()
+                panel.removeMasterPasswordFromWallet()
+                panel.lockSecureStorage()
+                panel.eraseQgisCredentials()
+                self.assertFalse(panel.eraseCredentialsButton.isEnabled())
+                self.assertFalse(panel.lockStorageButton.isEnabled())
+                editor.assert_not_called()
+            self.auth.isDisabled.return_value = True
+            panel.refresh()
+            self.assertFalse(panel.changeMasterButton.isEnabled())
+            self.assertFalse(panel.forgetMasterButton.isEnabled())
+            panel.removeMasterPasswordFromWallet()
+            panel.eraseQgisCredentials()
+            self.assertFalse(panel.eraseCredentialsButton.isEnabled())
+            editor.assert_not_called()
+
+    def test_password_store_disabled_failure_and_recovery(self):
+        panel = self.coverage_dialog().credentialsPanel
+        ui = importlib.import_module(ROOT.name + '.OpenTopography_DEMDownloader_credentials_ui')
+        self.assertFalse(panel.forgetMasterButton.isEnabled())
+        self.assertIn('disabled', panel.walletHint.text())
+        self.assertFalse(panel.walletHint.isHidden())
+        panel.keyEdit.setText('synthetic-new-key')
+        self.assertTrue(panel.saveButton.isEnabled())
+        self.assertTrue(panel.removeButton.isEnabled())
+        with patch.object(ui, 'QgsAuthEditorWidgets') as editor:
+            panel.removeMasterPasswordFromWallet()
+            editor.assert_not_called()
+            self.auth.passwordHelperEnabled.return_value = True
+            panel.pollState()
+            self.assertTrue(panel.forgetMasterButton.isEnabled())
+            self.assertTrue(panel.walletHint.isHidden())
+            panel._walletFailure()
+            panel.pollState()
+            self.assertFalse(panel.forgetMasterButton.isEnabled())
+            self.assertIn('could not be used', panel.walletHint.text())
+            self.assertTrue(panel.saveButton.isEnabled())
+            self.assertTrue(panel.changeMasterButton.isEnabled())
+            panel.removeMasterPasswordFromWallet()
+            editor.assert_not_called()
+            panel._walletSuccess()
+            panel.pollState()
+            self.assertTrue(panel.forgetMasterButton.isEnabled())
+            self.assertTrue(panel.walletHint.isHidden())
+
+    def test_remove_requests_unlock_and_does_not_remove_on_cancel(self):
+        panel = self.coverage_dialog().credentialsPanel
+        self.auth.masterPasswordIsSet.return_value = False
+        panel.refresh()
+        self.assertTrue(panel.removeButton.isEnabled())
+        with patch.object(plugin.credentials, 'unlock', return_value=False) as unlock, \
+             patch.object(plugin.credentials, 'remove_key') as remove:
+            panel.removeButton.click()
+            unlock.assert_called_once()
+            remove.assert_not_called()
+        with patch.object(plugin.credentials, 'unlock', return_value=True) as unlock, \
+             patch.object(plugin.credentials, 'remove_key') as remove:
+            panel.removeButton.click()
+            unlock.assert_called_once()
+            remove.assert_called_once()
+
+    def test_save_cancel_and_failure_preserve_masked_draft(self):
+        dialog = self.coverage_dialog()
+        panel = dialog.credentialsPanel
+        panel.keyEdit.setText('draft-secret-A123')
+        with patch.object(plugin.credentials, 'unlock', return_value=False), \
+             patch.object(plugin.credentials, 'save_key') as save:
+            panel.save()
+            save.assert_not_called()
+        self.assertEqual(panel.keyEdit.text(), 'draft-secret-A123')
+        self.assertIs(dialog.tabWidget().currentWidget(), panel)
+        with patch.object(plugin.credentials, 'unlock', return_value=True), \
+             patch.object(plugin.credentials, 'save_key', side_effect=QgsProcessingException('Storage unavailable')):
+            panel.save()
+        self.assertEqual(panel.keyEdit.text(), 'draft-secret-A123')
+        with patch.object(plugin.credentials, 'unlock', return_value=True), \
+             patch.object(plugin.credentials, 'save_key'):
+            panel.save()
+        self.assertEqual(panel.keyEdit.text(), '')
+        panel.keyEdit.undo()
+        self.assertEqual(panel.keyEdit.text(), '')
 
 
 if __name__ == '__main__':

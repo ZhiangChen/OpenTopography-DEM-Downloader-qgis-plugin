@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Optional coverage display; no changes to processing inputs or credentials."""
+"""Interactive coverage display and integration of the separate Credentials tab."""
 import json
 
-from qgis.PyQt.QtCore import QUrl
+from qgis.PyQt.QtCore import QUrl, Qt
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
-from qgis.PyQt.QtWidgets import QWidget, QHBoxLayout, QPushButton
+from qgis.PyQt.QtWidgets import QWidget, QHBoxLayout, QPushButton, QLabel
 from qgis.core import QgsNetworkAccessManager, QgsProject, QgsVectorLayer, QgsFillSymbol, QgsWkbTypes
 from processing.gui.AlgorithmDialog import AlgorithmDialog
 from processing.gui.ParametersPanel import ParametersPanel
 
 from .OpenTopography_DEMDownloader_algorithm import DATASETS
+from . import OpenTopography_DEMDownloader_credentials as credentials
+from .OpenTopography_DEMDownloader_credentials_ui import CredentialsPanel
 
 # Product IDs from OT's dataset metadata, distinct from collection IDs/API codes.
 # Keep these keyed by API code so changing a dropdown label cannot change routing.
@@ -93,7 +95,59 @@ class CoverageDialog(AlgorithmDialog):
         # The second positional argument is in_place, NOT parent.
         super().__init__(algorithm, in_place=False, parent=parent)
         self._reply = None
+        self._download_running = False
+        self.credentialStatus = QLabel(self)
+        self.credentialStatus.setTextFormat(Qt.TextFormat.PlainText)
+        self.credentialStatus.setWordWrap(True)
+        change = QPushButton(self.tr('Change credentials…'), self)
+        row = QWidget(self)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.credentialStatus, 1)
+        layout.addWidget(change)
+        self.mainWidget().addOutputWidget(row, 0)
+        self.credentialsPanel = CredentialsPanel(self)
+        # QGIS native showLog() assumes tab index 1. Append instead of shifting it.
+        self.tabWidget().addTab(self.credentialsPanel, self.tr('Credentials'))
+        change.clicked.connect(lambda: self.tabWidget().setCurrentWidget(self.credentialsPanel))
+        self.tabWidget().currentChanged.connect(lambda _: self.credentialsPanel.refresh())
         self.mainWidget().coverageButton.clicked.connect(self.showCoverage)
+
+    def setParameters(self, parameters):
+        # Ignore old history's plaintext key rather than restoring or exporting it.
+        allowed = {p.name() for p in self.algorithm().parameterDefinitions()}
+        super().setParameters({k: v for k, v in parameters.items() if k in allowed})
+
+    def ensureCredentials(self):
+        if not credentials.owns(credentials.existing_config()):
+            self.tabWidget().setCurrentWidget(self.credentialsPanel)
+            self.messageBar().pushWarning(self.tr('Credentials'), self.tr('Save an OpenTopography API key before running.'))
+            return False
+        if not credentials.manager().masterPasswordIsSet() and not self.credentialsPanel.unlock():
+            self.tabWidget().setCurrentWidget(self.credentialsPanel)
+            self.credentialsPanel.refresh()
+            return False
+        self.credentialsPanel.clear()
+        self.credentialsPanel.refresh()
+        return True
+
+    def runAlgorithm(self):
+        if self.ensureCredentials():
+            super().runAlgorithm()
+
+    def runAsBatch(self):
+        if self.ensureCredentials():
+            super().runAsBatch()
+
+    def blockAdditionalControlsWhileRunning(self):
+        super().blockAdditionalControlsWhileRunning()
+        self._download_running = True
+        self.credentialsPanel.updateControls()
+
+    def resetAdditionalGui(self):
+        super().resetAdditionalGui()
+        self._download_running = False
+        self.credentialsPanel.refresh()
 
     def getParametersPanel(self, algorithm, parent):
         return CoverageParametersPanel(parent, algorithm)
@@ -165,8 +219,10 @@ class CoverageDialog(AlgorithmDialog):
 
     def done(self, result):
         self.cancelCoverage()
+        self.credentialsPanel.clear()
         super().done(result)
 
     def closeEvent(self, event):
         self.cancelCoverage()
+        self.credentialsPanel.clear()
         super().closeEvent(event)

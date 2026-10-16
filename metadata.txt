@@ -37,6 +37,8 @@ about=This plugin will download DEMs from OpenTopography.org for user defined ex
  Coverage varies; downloads depend on USGS service availability.
   
  ** Get an access key from OpenTopography.org to download the DEMs
+ Save it in the Credentials tab using QGIS encrypted authentication storage.
+ Python, command/JSON and batch execution use the saved key without a key parameter.
 
 tracker=https://github.com/knwin/OpenTopography-DEM-Downloader-qgis-plugin/issues
 repository=https://github.com/knwin/OpenTopography-DEM-Downloader-qgis-plugin
